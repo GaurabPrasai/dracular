@@ -18,6 +18,7 @@
 
 #include <QBitArray>
 #include <QPointer>
+#include <QSet>
 
 #include <core/annotations.h>
 #include <core/document.h>
@@ -28,6 +29,10 @@
 #include <interfaces/saveinterface.h>
 
 #include <unordered_map>
+
+#if HAVE_POPPLER_CORE_OUTPUTDEV
+#include "darkreaderoutputdev.h"
+#endif
 
 class PDFOptionsPage;
 class PopplerAnnotationProxy;
@@ -168,7 +173,41 @@ private:
     bool documentHasPassword = false;
     QHash<int, Okular::Action *> m_additionalDocumentActions;
     void setAdditionalDocumentAction(Okular::Document::DocumentAdditionalActionType type, Okular::Action *action);
-    std::shared_ptr<void> m_signatureSettingsHandle;
+
+#if HAVE_POPPLER_CORE_OUTPUTDEV
+    // BEGIN Dark Reader exact image mask
+
+    // Makes sure m_darkReaderMaskCache has a valid mask for @p page at the
+    // given resolution, generating one via DarkReaderRenderer if needed.
+    // No-op if a matching mask is already cached.
+    void ensureDarkReaderMask(const Okular::Page *page, double dpiX, double dpiY);
+
+    // Secondary, independent PDFDoc used only to drive Dark Reader's
+    // mask-generating renders (see darkreaderoutputdev.h for why a second
+    // document is needed at all). Created lazily on first use and kept
+    // around for as long as it keeps succeeding; reset whenever it fails so
+    // the next attempt can retry from scratch (e.g. if the file was briefly
+    // unavailable).
+    std::unique_ptr<DarkReaderRenderer> m_darkReaderRenderer;
+
+    // Cached "exclude from recoloring" masks per page.
+    // The mask72 is the base mask rendered at a fixed 72 DPI, which is very fast
+    // and only done once. scaledMask is dynamically scaled to dpiX/dpiY.
+    struct DarkReaderMaskEntry {
+        QImage mask72;
+        QImage scaledMask;
+        double dpiX = 0;
+        double dpiY = 0;
+    };
+    QHash<int, DarkReaderMaskEntry> m_darkReaderMaskCache;
+    QSet<int> m_pagesWithUnsavedAnnotations;
+    // Tracks whether Dark Reader recolor was active at the last reparseConfig().
+    // Used to detect mid-session toggles: enabling Dark Reader primes no mask
+    // and paint alone can never warm it (only image() primes), so a toggle
+    // must invalidate pixmaps to force re-requests (which prime the mask).
+    bool m_darkReaderActive = false;
+    // END Dark Reader exact image mask
+#endif
 };
 
 #endif

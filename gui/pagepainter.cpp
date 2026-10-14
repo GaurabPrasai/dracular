@@ -18,11 +18,14 @@
 #include <QVarLengthArray>
 
 // system includes
+#include <algorithm>
 #include <math.h>
 #include <memory>
 
 // local includes
 #include "core/annotations.h"
+#include "core/document.h"
+#include "core/document_p.h"
 #include "core/observer.h"
 #include "core/page.h"
 #include "core/page_p.h"
@@ -43,6 +46,62 @@ inline QPen buildPen(const Okular::Annotation *ann, double width, const QColor &
     c.setAlphaF(ann->style().opacity());
     QPen p(QBrush(c), width, ann->style().lineStyle() == Okular::Annotation::Dashed ? Qt::DashLine : Qt::SolidLine, Qt::SquareCap, Qt::MiterJoin);
     return p;
+}
+
+/**
+ * Fetches the "exclude from recoloring" mask a generator may have produced
+ * for @p page (currently: the PDF generator's Dark Reader render path; see
+ * PDFGenerator::metaData()'s "NoRecolorMask" key), and adapts it to line up
+ * pixel-for-pixel with the region about to be painted.
+ *
+ * @p fullPageDeviceSize is the size, in device pixels, of the full
+ * (uncropped) page at the current zoom level; @p deviceRectInFullPage is the
+ * sub-rectangle of that full page, also in device pixels, that is actually
+ * being painted right now (i.e. what \c backImage covers). Both mirror
+ * exactly how the page pixmap itself is scaled and cropped a few lines below.
+ *
+ * Returns a null QImage if no mask is available, e.g. because the document
+ * is not a PDF, Dark Reader has not rendered this page yet, or Okular was
+ * built without Poppler's core library headers. Callers must treat a null
+ * mask as "nothing is excluded", not as an error.
+ */
+static QImage fetchNoRecolorMask(const Okular::Page *page, const QSize &fullPageDeviceSize, const QRect &deviceRectInFullPage)
+{
+    if (!page || fullPageDeviceSize.isEmpty() || deviceRectInFullPage.isEmpty()) {
+        return QImage();
+    }
+
+    Okular::PagePrivate *pageP = Okular::PagePrivate::get(const_cast<Okular::Page *>(page));
+    if (!pageP || !pageP->m_doc || !pageP->m_doc->m_parent) {
+        return QImage();
+    }
+
+    const QVariant maskVariant = pageP->m_doc->m_parent->metaData(QStringLiteral("NoRecolorMask"), page->number());
+    if (!maskVariant.canConvert<QImage>()) {
+        return QImage();
+    }
+
+    QImage mask = maskVariant.value<QImage>();
+    if (mask.isNull()) {
+        return QImage();
+    }
+
+    // The mask was generated at the same nominal resolution as the pixmap
+    // request that produced it, which will not always exactly match the
+    // page's current on-screen size (e.g. a cached pixmap from a slightly
+    // different zoom level being reused momentarily). Scale and crop it
+    // exactly like the page pixmap itself is scaled and cropped, so it lines
+    // up with the image being recolored.
+    if (mask.size() != fullPageDeviceSize) {
+        mask = mask.scaled(fullPageDeviceSize);
+    }
+
+    const QRect clampedRect = deviceRectInFullPage.intersected(QRect(QPoint(0, 0), fullPageDeviceSize));
+    if (clampedRect.isEmpty()) {
+        return QImage();
+    }
+
+    return mask.copy(clampedRect);
 }
 
 void PagePainter::paintPageOnPainter(QPainter *destPainter, const Okular::Page *page, Okular::DocumentObserver *observer, int flags, int scaledWidth, int scaledHeight, const QRect limits)
@@ -93,6 +152,9 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
         case Okular::SettingsCore::EnumRenderMode::Recolor:
             backgroundColor = Okular::Settings::recolorBackground();
             break;
+        case Okular::SettingsCore::EnumRenderMode::DarkReader:
+            backgroundColor = QColor(0x31, 0x36, 0x3b);
+            break;
         default:;
         }
     }
@@ -138,6 +200,7 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
     // make this a qcolor, rect map, since we don't need
     // to know s_id here! we are only drawing this right?
     QList<QPair<QColor, Okular::NormalizedRect>> bufferedHighlights;
+    QList<Okular::NormalizedRect> bufferedTextSelections;
     QList<Okular::Annotation *> bufferedAnnotations;
     QList<Okular::Annotation *> unbufferedAnnotations;
     Okular::Annotation *boundingRectOnlyAnn = nullptr; // Paint the bounding rect of this annotation
@@ -163,7 +226,7 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
             const Okular::RegularAreaRect *textSelection = page->textSelection();
             for (const auto &rect : std::as_const(*textSelection)) {
                 if (rect.intersects(limitRect)) {
-                    bufferedHighlights.append(qMakePair(page->textSelectionColor(), rect));
+                    bufferedTextSelections.append(rect);
                 }
             }
         }
@@ -213,7 +276,7 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
 
     /** 3 - ENABLE BACKBUFFERING IF DIRECT IMAGE MANIPULATION IS NEEDED **/
     const bool bufferAccessibility = (flags & Accessibility) && Okular::SettingsCore::changeColors() && (Okular::SettingsCore::renderMode() != Okular::SettingsCore::EnumRenderMode::Paper);
-    const bool useBackBuffer = bufferAccessibility || !bufferedHighlights.isEmpty() || !bufferedAnnotations.isEmpty() || viewPortPoint;
+    const bool useBackBuffer = bufferAccessibility || !bufferedHighlights.isEmpty() || !bufferedTextSelections.isEmpty() || !bufferedAnnotations.isEmpty() || viewPortPoint;
     QPixmap backPixmap; // order of declarations is important: ownedPainter should be destroyed before its pixmap
     std::unique_ptr<QPainter> ownedPainter;
     QPainter *mixedPainter = nullptr; // Will point to either a provided destPainter or the ownedPainter
@@ -316,6 +379,28 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
             case Okular::SettingsCore::EnumRenderMode::HueShiftNegative:
                 hueShiftNegative(&backImage);
                 break;
+            case Okular::SettingsCore::EnumRenderMode::DarkReader: {
+                // Text color #eff0f1, background color #232627 (default) or config-driven. Embedded raster
+                // images are left untouched, using an exact per-pixel mask
+                // provided by the generator when available (currently: PDF
+                // only), falling back to recoloring the whole page otherwise.
+                QColor bgColor;
+                switch (Okular::Settings::darkReaderBackgroundMode()) {
+                case Okular::Settings::EnumDarkReaderBackgroundMode::ColorScheme:
+                    bgColor = QApplication::palette().color(QPalette::Active, QPalette::Window);
+                    break;
+                case Okular::Settings::EnumDarkReaderBackgroundMode::Custom:
+                    bgColor = Okular::Settings::darkReaderCustomBackgroundColor();
+                    break;
+                case Okular::Settings::EnumDarkReaderBackgroundMode::Default:
+                default:
+                    bgColor = QColor(0x23, 0x26, 0x27);
+                    break;
+                }
+                const QImage noRecolorMask = fetchNoRecolorMask(page, QSize(dScaledWidth, dScaledHeight), dLimitsInPixmap);
+                recolorExcludingMask(&backImage, QColor(0xef, 0xf0, 0xf1), bgColor, noRecolorMask);
+                break;
+            }
             }
         }
 
@@ -332,7 +417,8 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
                     compMode = QPainter::CompositionMode_Difference;
                     break;
                 case Okular::SettingsCore::EnumRenderMode::Inverted: // fall through
-                case Okular::SettingsCore::EnumRenderMode::Recolor:
+                case Okular::SettingsCore::EnumRenderMode::Recolor:  // fall through
+                case Okular::SettingsCore::EnumRenderMode::DarkReader:
                     // CompositionMode_Multiply makes highlights invisible when background
                     // color is close to dark
                     compMode = QPainter::CompositionMode_Difference;
@@ -354,6 +440,35 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
             const QRect frameRect = r.geometry(scaledWidth, scaledHeight).translated(-scaledCrop.topLeft()).translated(-limits.left(), -limits.top());
             painter.setPen(frameColor);
             painter.drawRect(frameRect);
+        }
+
+        // draw text selections that are inside the 'limits' paint region
+        if (!bufferedTextSelections.isEmpty()) {
+            QPainter::CompositionMode compMode = QPainter::CompositionMode_Multiply;
+            QColor highlightColor = page->textSelectionColor();
+            QColor frameColor = highlightColor.darker(150);
+            if (Okular::SettingsCore::changeColors()) {
+                if (Okular::SettingsCore::renderMode() == Okular::SettingsCore::EnumRenderMode::Paper) {
+                    compMode = QPainter::CompositionMode_Difference;
+                } else {
+                    compMode = QPainter::CompositionMode_Screen;
+                    frameColor.setRgb((frameColor.red() - 255) * -1, (frameColor.green() - 255) * -1, (frameColor.blue() - 255) * -1);
+                }
+            }
+
+            for (const auto &r : std::as_const(bufferedTextSelections)) {
+                // find out the rect to highlight on pixmap
+                QRect highlightRect = r.geometry(scaledWidth, scaledHeight).translated(-scaledCrop.topLeft()).intersected(limits);
+                highlightRect.translate(-limits.left(), -limits.top());
+
+                QPainter painter(&backImage);
+                painter.setCompositionMode(compMode);
+                painter.fillRect(highlightRect, highlightColor);
+
+                const QRect frameRect = r.geometry(scaledWidth, scaledHeight).translated(-scaledCrop.topLeft()).translated(-limits.left(), -limits.top());
+                painter.setPen(frameColor);
+                painter.drawRect(frameRect);
+            }
         }
 
         // 4B.4. paint annotations [COMPOSITED ONES]
@@ -406,7 +521,7 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
                     switch (hlType) {
                     // highlight the whole rect
                     case Okular::HighlightAnnotation::Highlight:
-                        drawShapeOnImage(backImage, path, true, Qt::NoPen, acolor, pageScale, Multiply);
+                        drawShapeOnImage(backImage, path, true, Qt::NoPen, acolor, pageScale, Okular::SettingsCore::changeColors() ? Normal : Multiply);
                         break;
                     // highlight the bottom part of the rect
                     case Okular::HighlightAnnotation::Squiggly:
@@ -414,7 +529,7 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
                         path[3].y = (path[0].y + path[3].y) / 2.0;
                         path[2].x = (path[1].x + path[2].x) / 2.0;
                         path[2].y = (path[1].y + path[2].y) / 2.0;
-                        drawShapeOnImage(backImage, path, true, Qt::NoPen, acolor, pageScale, Multiply);
+                        drawShapeOnImage(backImage, path, true, Qt::NoPen, acolor, pageScale, Okular::SettingsCore::changeColors() ? Normal : Multiply);
                         break;
                     // make a line at 3/4 of the height
                     case Okular::HighlightAnnotation::Underline:
@@ -681,18 +796,119 @@ void PagePainter::recolor(QImage *image, const QColor &foreground, const QColor 
     const int foreground_green = foreground.green();
     const int foreground_blue = foreground.blue();
 
+    QRgb lut[256];
+    for (int l = 0; l < 256; ++l) {
+        const int r = std::clamp(static_cast<int>(scaleRed * l + foreground_red), 0, 255);
+        const int g = std::clamp(static_cast<int>(scaleGreen * l + foreground_green), 0, 255);
+        const int b = std::clamp(static_cast<int>(scaleBlue * l + foreground_blue), 0, 255);
+        lut[l] = qRgb(r, g, b);
+    }
+
     QRgb *data = reinterpret_cast<QRgb *>(image->bits());
     const int pixels = image->width() * image->height();
 
+    const bool isDarkMode = qGray(background.rgb()) < qGray(foreground.rgb());
+
     for (int i = 0; i < pixels; ++i) {
-        const int lightness = qGray(data[i]);
+        const QRgb pixel = data[i];
+        const uchar r_orig = qRed(pixel);
+        const uchar g_orig = qGreen(pixel);
+        const uchar b_orig = qBlue(pixel);
 
-        const float r = scaleRed * lightness + foreground_red;
-        const float g = scaleGreen * lightness + foreground_green;
-        const float b = scaleBlue * lightness + foreground_blue;
+        const int max_val = qMax(r_orig, qMax(g_orig, b_orig));
+        const int min_val = qMin(r_orig, qMin(g_orig, b_orig));
 
-        const unsigned a = qAlpha(data[i]);
-        data[i] = qRgba(r, g, b, a);
+        if (max_val - min_val > 20) {
+            // Colored pixel (e.g. highlight, underline, links)
+            if (isDarkMode) {
+                uchar R = r_orig;
+                uchar G = g_orig;
+                uchar B = b_orig;
+                invertLumaPixel(R, G, B, 0.2126, 0.7152, 0.0722); // sRGB luma coefficients
+                data[i] = qRgba(R, G, B, qAlpha(pixel));
+            }
+            // (In light modes, we keep the original color, so do nothing)
+        } else {
+            // Neutral pixel (text, background, grayscale)
+            const int lightness = qGray(pixel);
+            data[i] = (lut[lightness] & 0x00ffffff) | (pixel & 0xff000000);
+        }
+    }
+}
+
+void PagePainter::recolorExcludingMask(QImage *image, const QColor &foreground, const QColor &background, const QImage &noRecolorMask)
+{
+    if (noRecolorMask.isNull()) {
+        recolor(image, foreground, background);
+        return;
+    }
+
+    if (image->format() != QImage::Format_ARGB32_Premultiplied) {
+        qCWarning(OkularUiDebug) << "Wrong image format! Converting...";
+        *image = image->convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    }
+
+    Q_ASSERT(image->format() == QImage::Format_ARGB32_Premultiplied);
+
+    if (noRecolorMask.size() != image->size()) {
+        qCWarning(OkularUiDebug) << "noRecolorMask size does not match image size, ignoring it";
+        recolor(image, foreground, background);
+        return;
+    }
+
+    const float scaleRed = background.redF() - foreground.redF();
+    const float scaleGreen = background.greenF() - foreground.greenF();
+    const float scaleBlue = background.blueF() - foreground.blueF();
+
+    const int foreground_red = foreground.red();
+    const int foreground_green = foreground.green();
+    const int foreground_blue = foreground.blue();
+
+    QRgb lut[256];
+    for (int l = 0; l < 256; ++l) {
+        const int r = std::clamp(static_cast<int>(scaleRed * l + foreground_red), 0, 255);
+        const int g = std::clamp(static_cast<int>(scaleGreen * l + foreground_green), 0, 255);
+        const int b = std::clamp(static_cast<int>(scaleBlue * l + foreground_blue), 0, 255);
+        lut[l] = qRgb(r, g, b);
+    }
+
+    const QImage mask = noRecolorMask.format() == QImage::Format_Grayscale8 ? noRecolorMask : noRecolorMask.convertToFormat(QImage::Format_Grayscale8);
+
+    QRgb *data = reinterpret_cast<QRgb *>(image->bits());
+    const bool isDarkMode = qGray(background.rgb()) < qGray(foreground.rgb());
+
+    for (int y = 0, i = 0; y < image->height(); ++y) {
+        const uchar *maskRow = mask.constScanLine(y);
+        for (int x = 0; x < image->width(); ++x, ++i) {
+            if (maskRow[x] >= 128) {
+                // Exclude from recoloring
+                continue;
+            }
+
+            const QRgb pixel = data[i];
+            const uchar r_orig = qRed(pixel);
+            const uchar g_orig = qGreen(pixel);
+            const uchar b_orig = qBlue(pixel);
+
+            const int max_val = qMax(r_orig, qMax(g_orig, b_orig));
+            const int min_val = qMin(r_orig, qMin(g_orig, b_orig));
+
+            if (max_val - min_val > 20) {
+                // Colored pixel (e.g. highlight, underline, links)
+                if (isDarkMode) {
+                    uchar R = r_orig;
+                    uchar G = g_orig;
+                    uchar B = b_orig;
+                    invertLumaPixel(R, G, B, 0.2126, 0.7152, 0.0722); // sRGB luma coefficients
+                    data[i] = qRgba(R, G, B, qAlpha(pixel));
+                }
+                // (In light modes, we keep the original color, so do nothing)
+            } else {
+                // Neutral pixel (text, background, grayscale)
+                const int lightness = qGray(pixel);
+                data[i] = (lut[lightness] & 0x00ffffff) | (pixel & 0xff000000);
+            }
+        }
     }
 }
 
