@@ -22,9 +22,11 @@
 #include "annotations.h"
 #include "document_p.h"
 #include "page.h"
+#include "settings_core.h"
 #include "textpage.h"
 
 #include <cmath>
+#include <cstring>
 
 using namespace Okular;
 
@@ -306,6 +308,12 @@ Document::OpenResult TextDocumentGenerator::loadDocumentWithPassword(const QStri
     if (d->mDocument) {
         d->mDocument->setDefaultFont(d->mFont);
     }
+
+    // Sync the Dark Reader state, so that opening a document while the mode is
+    // already active is not mistaken for a mid-session toggle by
+    // reparseConfig().
+    d->mDarkReaderActive = SettingsCore::changeColors() && SettingsCore::renderMode() == SettingsCore::EnumRenderMode::DarkReader;
+    d->mDarkReaderMasks.clear();
     d->generateTitleInfos();
     const QList<TextDocumentGeneratorPrivate::LinkInfo> linkInfos = d->generateLinkInfos();
     const QList<TextDocumentGeneratorPrivate::AnnotationInfo> annotationInfos = d->generateAnnotationInfos();
@@ -362,6 +370,8 @@ bool TextDocumentGenerator::doCloseDocument()
     // do not use clear() for the following two, otherwise they change type
     d->mDocumentInfo = Okular::DocumentInfo();
     d->mDocumentSynopsis = Okular::DocumentSynopsis();
+
+    d->mDarkReaderMasks.clear();
 
     return true;
 }
@@ -453,11 +463,101 @@ const Okular::DocumentSynopsis *TextDocumentGenerator::generateDocumentSynopsis(
 
 QVariant TextDocumentGeneratorPrivate::metaData(const QString &key, const QVariant &option) const
 {
-    Q_UNUSED(option)
     if (key == QLatin1String("DocumentTitle")) {
         return mDocumentInfo.get(DocumentInfo::Title);
     }
+    if (key == QLatin1String("NoRecolorMask")) {
+        // Used by PagePainter to fetch the exact "exclude from recoloring"
+        // mask of a page while Dark Reader is active, so that the images
+        // embedded in a text document are left untouched by the recoloring.
+        // option is the (int) page number; a null image means that the page
+        // has no images at all, in which case PagePainter recolors the whole
+        // page (which is then exactly right).
+        const int pageNumber = option.toInt();
+        auto it = mDarkReaderMasks.constFind(pageNumber);
+        if (it == mDarkReaderMasks.constEnd()) {
+            it = mDarkReaderMasks.insert(pageNumber, darkReaderNoRecolorMask(pageNumber));
+        }
+        return QVariant::fromValue(it.value());
+    }
     return QVariant();
+}
+
+/**
+ * Locates the images drawn on @p pageNumber and returns a mask marking them,
+ * i.e. a grayscale image in which every pixel belonging to an image is 255
+ * and everything else is 0.
+ *
+ * The mask is built at the document's natural page size; PagePainter scales
+ * it to whatever resolution the page is painted at, just like it scales the
+ * mask the PDF backend generates at a fixed 72 DPI.
+ *
+ * The rect of an image is obtained from
+ * TextDocumentUtils::calculateBoundingRect(), the same helper that is used to
+ * build the text page of a document, so images are located exactly like the
+ * text around them. An image is a single character (the object replacement
+ * character) carrying an image format, which is why a one character range is
+ * enough to ask for its bounding rect.
+ */
+QImage TextDocumentGeneratorPrivate::darkReaderNoRecolorMask(int pageNumber) const
+{
+    if (!mDocument || pageNumber < 0) {
+        return QImage();
+    }
+
+    const QSizeF pageSize = mDocument->pageSize();
+    const int pageWidth = qRound(pageSize.width());
+    const int pageHeight = qRound(pageSize.height());
+    if (pageWidth <= 0 || pageHeight <= 0) {
+        return QImage();
+    }
+
+    int start = 0;
+    int end = 0;
+    TextDocumentUtils::calculatePositions(mDocument, pageNumber, start, end);
+    if (end <= start) {
+        return QImage();
+    }
+
+    QImage mask;
+    for (QTextBlock block = mDocument->findBlock(start); block.isValid() && block.position() < end; block = block.next()) {
+        for (QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it) {
+            const QTextFragment fragment = it.fragment();
+            if (!fragment.isValid() || !fragment.charFormat().isImageFormat()) {
+                continue;
+            }
+
+            const int position = fragment.position();
+            if (position < start || position >= end) {
+                continue;
+            }
+
+            QRectF rect;
+            int page = -1;
+            TextDocumentUtils::calculateBoundingRect(mDocument, position, position + 1, rect, page);
+            if (page != pageNumber) {
+                // The image is drawn (or started) on another page.
+                continue;
+            }
+
+            const QRect imageRect = QRectF(rect.x() * pageWidth, rect.y() * pageHeight, rect.width() * pageWidth, rect.height() * pageHeight).toAlignedRect();
+            // One pixel of slack covers the anti-aliased edge of the image.
+            const QRect fillRect = imageRect.adjusted(-1, -1, 1, 1).intersected(QRect(0, 0, pageWidth, pageHeight));
+            if (fillRect.isEmpty()) {
+                continue;
+            }
+
+            if (mask.isNull()) {
+                mask = QImage(pageWidth, pageHeight, QImage::Format_Grayscale8);
+                mask.fill(0);
+            }
+            for (int y = fillRect.top(); y <= fillRect.bottom(); ++y) {
+                std::memset(mask.scanLine(y) + fillRect.left(), 255, fillRect.width());
+            }
+        }
+    }
+
+    return mask;
 }
 
 Okular::ExportFormat::List TextDocumentGenerator::exportFormats() const
@@ -521,6 +621,8 @@ bool TextDocumentGenerator::exportTo(const QString &fileName, const Okular::Expo
 bool TextDocumentGenerator::reparseConfig()
 {
     Q_D(TextDocumentGenerator);
+    bool somethingchanged = false;
+
     const QFont newFont = d->mGeneralSettings->font();
 
     if (newFont != d->mFont) {
@@ -528,10 +630,27 @@ bool TextDocumentGenerator::reparseConfig()
         if (d->mDocument) {
             d->mDocument->setDefaultFont(d->mFont);
         }
-        return true;
+        somethingchanged = true;
     }
 
-    return false;
+    // Dark Reader draws text and images differently, so a mid-session toggle
+    // of the mode has to invalidate the cached page pixmaps and make the
+    // observers repaint. Reporting a change here is what makes
+    // Document::reparseConfig() evict the pixmaps and notify the observers;
+    // the PDF backend does the same in PDFGenerator::reparseConfig().
+    const bool darkReaderActive = SettingsCore::changeColors() && SettingsCore::renderMode() == SettingsCore::EnumRenderMode::DarkReader;
+    if (darkReaderActive != d->mDarkReaderActive) {
+        d->mDarkReaderActive = darkReaderActive;
+        somethingchanged = true;
+    }
+
+    if (somethingchanged) {
+        // The masks are tied to the document layout, which the font change
+        // above may just have invalidated; regenerate them on demand.
+        d->mDarkReaderMasks.clear();
+    }
+
+    return somethingchanged;
 }
 
 void TextDocumentGenerator::addPages(KConfigDialog * /*dlg*/)
@@ -559,6 +678,7 @@ void TextDocumentGenerator::setTextDocument(QTextDocument *textDocument)
     Q_D(TextDocumentGenerator);
 
     d->mDocument = textDocument;
+    d->mDarkReaderMasks.clear();
 
     for (Page *p : std::as_const(d->m_document->m_pagesVector)) {
         p->setTextPage(nullptr);

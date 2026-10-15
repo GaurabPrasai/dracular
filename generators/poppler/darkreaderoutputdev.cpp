@@ -45,8 +45,11 @@ namespace
 class MaskingSplashOutputDev : public SplashOutputDev
 {
 public:
-    MaskingSplashOutputDev(SplashColorMode colorModeA, int bitmapRowPadA, bool reverseVideoA, SplashColorPtr paperColorA, bool bitmapTopDownA, SplashThinLineMode thinLineModeA)
-        : SplashOutputDev(colorModeA, bitmapRowPadA, reverseVideoA, paperColorA, bitmapTopDownA, thinLineModeA)
+    // Note: current Poppler no longer takes a reverseVideo argument in
+    // SplashOutputDev's constructor (removed upstream, since every caller
+    // passed false), so the base is constructed without it.
+    MaskingSplashOutputDev(SplashColorMode colorModeA, int bitmapRowPadA, SplashColorPtr paperColorA, bool bitmapTopDownA, SplashThinLineMode thinLineModeA)
+        : SplashOutputDev(colorModeA, bitmapRowPadA, paperColorA, bitmapTopDownA, thinLineModeA)
     {
     }
 
@@ -198,7 +201,7 @@ bool DarkReaderRenderer::render(int pageNumber, double dpiX, double dpiY, QImage
     // so the bitmap this produces is pixel-for-pixel equivalent to what the
     // normal (non-Dark-Reader) rendering path would have produced for the
     // same page and resolution.
-    MaskingSplashOutputDev out(splashModeXBGR8, 4, false, paperColor, true, splashThinLineDefault);
+    MaskingSplashOutputDev out(splashModeXBGR8, 4, paperColor, true, splashThinLineDefault);
     out.startDoc(m_doc.get());
     out.setFontAntialias(true);
     out.setVectorAntialias(true);
