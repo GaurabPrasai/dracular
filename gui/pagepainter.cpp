@@ -50,9 +50,10 @@ inline QPen buildPen(const Okular::Annotation *ann, double width, const QColor &
 
 /**
  * Fetches the "exclude from recoloring" mask a generator may have produced
- * for @p page (currently: the PDF generator's Dark Reader render path; see
- * PDFGenerator::metaData()'s "NoRecolorMask" key), and adapts it to line up
- * pixel-for-pixel with the region about to be painted.
+ * for @p page (currently: the PDF generator's Dark Reader render path and the
+ * text-document generator, i.e. EPUB; see PDFGenerator::metaData()'s and
+ * TextDocumentGeneratorPrivate::metaData()'s "NoRecolorMask" key), and adapts
+ * it to line up pixel-for-pixel with the region about to be painted.
  *
  * @p fullPageDeviceSize is the size, in device pixels, of the full
  * (uncropped) page at the current zoom level; @p deviceRectInFullPage is the
@@ -60,10 +61,11 @@ inline QPen buildPen(const Okular::Annotation *ann, double width, const QColor &
  * being painted right now (i.e. what \c backImage covers). Both mirror
  * exactly how the page pixmap itself is scaled and cropped a few lines below.
  *
- * Returns a null QImage if no mask is available, e.g. because the document
- * is not a PDF, Dark Reader has not rendered this page yet, or Okular was
- * built without Poppler's core library headers. Callers must treat a null
- * mask as "nothing is excluded", not as an error.
+ * Returns a null QImage if no mask is available, e.g. because the document's
+ * backend does not provide masks, the page has no images, Dark Reader has not
+ * rendered this page yet, or Okular was built without Poppler's core library
+ * headers. Callers must treat a null mask as "nothing is excluded", not as an
+ * error.
  */
 static QImage fetchNoRecolorMask(const Okular::Page *page, const QSize &fullPageDeviceSize, const QRect &deviceRectInFullPage)
 {
@@ -382,8 +384,9 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
             case Okular::SettingsCore::EnumRenderMode::DarkReader: {
                 // Text color #eff0f1, background color #232627 (default) or config-driven. Embedded raster
                 // images are left untouched, using an exact per-pixel mask
-                // provided by the generator when available (currently: PDF
-                // only), falling back to recoloring the whole page otherwise.
+                // provided by the generator when available (PDF, and the
+                // text-document backends, i.e. EPUB), falling back to
+                // recoloring the whole page otherwise.
                 QColor bgColor;
                 switch (Okular::Settings::darkReaderBackgroundMode()) {
                 case Okular::Settings::EnumDarkReaderBackgroundMode::ColorScheme:

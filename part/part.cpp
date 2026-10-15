@@ -966,8 +966,8 @@ void Part::setupActions()
     playPauseAction->setEnabled(false);
 
     // Dark Reader: inverts text and background colors (using a dark gray/off-white palette
-    // instead of pure black/white) while leaving images untouched. Currently only supported
-    // for PDF documents; see updateViewActions().
+    // instead of pure black/white) while leaving images untouched. Currently supported for
+    // PDF documents and for text-document backends such as EPUB; see updateViewActions().
     m_darkReaderAction = ac->add<KToggleAction>(QStringLiteral("dark_reader_mode"));
     m_darkReaderAction->setText(i18nc("@action:inmenu, toggles the dark color scheme for the document", "Dark Reader"));
     m_darkReaderAction->setIcon(QIcon::fromTheme(QStringLiteral("view-dark-mode"), QIcon::fromTheme(QStringLiteral("weather-clear-night"))));
@@ -2067,13 +2067,13 @@ void Part::slotToggleDarkReader()
     }
     Okular::SettingsCore::setChangeColors(enabled);
     Okular::SettingsCore::self()->save();
-    // Toggling Dark Reader primes no image mask (only image() does via
-    // ensureDarkReaderMask), so a bare repaint would fall back to full-page
-    // recolor until the next zoom. Route through reparseConfig(): the PDF
-    // generator detects the Dark Reader transition and reports a change, and
-    // Document then evicts cached pixmaps + notifies observers, forcing
-    // re-requests of the visible pages which prime the masks. No-op for
-    // non-PDF generators (their reparseConfig is untouched).
+    // Toggling Dark Reader primes no image mask, so a bare repaint would fall
+    // back to full-page recolor until the next zoom. Route through
+    // reparseConfig(): the PDF generator detects the Dark Reader transition
+    // (and primes the masks while re-rendering the pages), the text-document
+    // generator detects it too and drops its cached masks, and Document then
+    // evicts cached pixmaps + notifies observers, forcing re-requests of the
+    // visible pages.
     if (m_document) {
         m_document->reparseConfig();
     }
@@ -2323,11 +2323,14 @@ void Part::updateViewActions()
     Q_EMIT viewerMenuStateChange(opened);
 
     if (m_darkReaderAction) {
-        // Dark Reader is currently only supported for PDF documents.
+        // Dark Reader is currently supported for PDF documents and for the
+        // text-document backends, i.e. EPUB (and friends), which are the two
+        // kinds of backend that can tell PagePainter which parts of a page
+        // must not be recolored.
         const QString mimeTypeName = opened ? m_document->documentInfo().get(DocumentInfo::MimeType) : QString();
-        const bool isPdf = mimeTypeName == QLatin1String("application/pdf");
-        m_darkReaderAction->setEnabled(opened && isPdf);
-        if (!isPdf && m_darkReaderAction->isChecked()) {
+        const bool isSupported = mimeTypeName == QLatin1String("application/pdf") || mimeTypeName == QLatin1String("application/epub+zip");
+        m_darkReaderAction->setEnabled(opened && isSupported);
+        if (!isSupported && m_darkReaderAction->isChecked()) {
             m_darkReaderAction->setChecked(false);
         }
     }

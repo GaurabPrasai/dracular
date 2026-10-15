@@ -20,6 +20,8 @@
 #include <QPointer>
 #include <QSet>
 
+#include <memory>
+
 #include <core/annotations.h>
 #include <core/document.h>
 #include <core/generator.h>
@@ -173,6 +175,7 @@ private:
     bool documentHasPassword = false;
     QHash<int, Okular::Action *> m_additionalDocumentActions;
     void setAdditionalDocumentAction(Okular::Document::DocumentAdditionalActionType type, Okular::Action *action);
+    std::shared_ptr<void> m_signatureSettingsHandle;
 
 #if HAVE_POPPLER_CORE_OUTPUTDEV
     // BEGIN Dark Reader exact image mask

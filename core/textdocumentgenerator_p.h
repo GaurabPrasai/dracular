@@ -8,6 +8,8 @@
 #define _OKULAR_TEXTDOCUMENTGENERATOR_P_H_
 
 #include <QAbstractTextDocumentLayout>
+#include <QHash>
+#include <QImage>
 #include <QTextBlock>
 #include <QTextDocument>
 
@@ -204,6 +206,15 @@ public:
     /* reimp */ QVariant metaData(const QString &key, const QVariant &option) const override;
     /* reimp */ QImage image(PixmapRequest *) override;
 
+    /**
+     * Builds the Dark Reader "exclude from recoloring" mask of a page, i.e.
+     * a grayscale image in which every pixel covered by an image drawn on
+     * that page is 255 and everything else is 0. Same contract as the mask
+     * the PDF backend exposes through its "NoRecolorMask" meta data, see
+     * Okular::PagePainter::recolorExcludingMask().
+     */
+    QImage darkReaderNoRecolorMask(int pageNumber) const;
+
     void calculateBoundingRect(int startPosition, int endPosition, QRectF &rect, int &page) const;
     void calculatePositions(int page, int &start, int &end) const;
     Okular::TextPage *createTextPage(int) const;
@@ -248,6 +259,21 @@ public:
     TextDocumentSettings *mGeneralSettings;
 
     QFont mFont;
+
+    /**
+     * Dark Reader: the "exclude from recoloring" masks of the pages, created
+     * on demand (PagePainter asks for one on every paint of a page, while the
+     * underlying image rects only change when the document layout does).
+     * A page whose images were already looked for is present in the hash even
+     * if it turned out to have none, in which case its mask is a null image.
+     */
+    mutable QHash<int, QImage> mDarkReaderMasks;
+
+    /**
+     * Dark Reader: state of the mode at the last reparseConfig(), so that a
+     * mid-session toggle of it can be detected and reported as a change.
+     */
+    bool mDarkReaderActive = false;
 };
 
 }
